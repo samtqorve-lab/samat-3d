@@ -82,6 +82,56 @@ def decrypt_file(src, dst, key):
             cur, i = nxt, i + 1
 
 
+BUNDLE_MAGIC = b"S3DB"
+
+
+def unpack_bundle(data, out_dir):
+    """Unpack a decrypted photo bundle: S3DB | count u32 | (name_len u16, name, data_len u32, data)*"""
+    off = 4
+    (count,) = struct.unpack_from(">I", data, off)
+    off += 4
+    written = 0
+    for _ in range(count):
+        (name_len,) = struct.unpack_from(">H", data, off)
+        off += 2
+        name = data[off:off + name_len].decode("utf-8")
+        off += name_len
+        (data_len,) = struct.unpack_from(">I", data, off)
+        off += 4
+        blob = data[off:off + data_len]
+        off += data_len
+        if len(blob) != data_len:
+            raise ValueError("truncated bundle")
+        safe = Path(name).name
+        if not safe or safe.startswith(".") or Path(safe).suffix.lower() not in (".jpg", ".jpeg"):
+            raise ValueError("unexpected file name in bundle")
+        (out_dir / safe).write_bytes(blob)
+        written += 1
+    return written
+
+
+def decrypt_dir(src_dir, dst_dir, ext, key):
+    """Decrypt every *.enc. Each file is either a single photo or a photo bundle (S3DB)."""
+    out = Path(dst_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    files = sorted(Path(src_dir).glob("*.enc"))
+    if not files:
+        sys.exit("no .enc files found")
+    tmp = out / ".decrypt.tmp"
+    total = 0
+    for f in files:
+        decrypt_file(f, tmp, key)
+        with open(tmp, "rb") as fh:
+            magic = fh.read(4)
+        if magic == BUNDLE_MAGIC:
+            total += unpack_bundle(tmp.read_bytes(), out)
+            tmp.unlink()
+        else:
+            tmp.rename(out / (f.stem + ext))
+            total += 1
+    print(f"decrypted {len(files)} files -> {total} photos")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -118,14 +168,7 @@ def main():
     elif a.cmd == "decrypt":
         decrypt_file(a.src, a.dst, key)
     elif a.cmd == "decrypt-dir":
-        out = Path(a.dst_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        files = sorted(Path(a.src_dir).glob("*.enc"))
-        if not files:
-            sys.exit("no .enc files found")
-        for f in files:
-            decrypt_file(f, out / (f.stem + a.ext), key)
-        print(f"decrypted {len(files)} files")
+        decrypt_dir(a.src_dir, a.dst_dir, a.ext, key)
     elif a.cmd == "encrypt-dir":
         out = Path(a.dst_dir)
         out.mkdir(parents=True, exist_ok=True)
