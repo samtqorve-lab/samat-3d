@@ -84,13 +84,25 @@ def decrypt_file(src, dst, key):
 
 BUNDLE_MAGIC = b"S3DB"
 
+# Besides photos, a bundle may carry small text files for the ODM run:
+#   geo.txt        camera positions (PPK/RTK)          -> images dir
+#   gcp_list.txt   ground control points               -> images dir
+#   job.json       processing options (mode, georef..) -> meta_out path
+GEO_FILES = ("geo.txt", "gcp_list.txt")
+META_NAME = "job.json"
+MAX_TEXT_BYTES = 4 * 1024 * 1024
 
-def unpack_bundle(data, out_dir):
-    """Unpack a decrypted photo bundle: S3DB | count u32 | (name_len u16, name, data_len u32, data)*"""
+
+def unpack_bundle(data, out_dir, meta_out=None):
+    """Unpack a decrypted bundle: S3DB | count u32 | (name_len u16, name, data_len u32, data)*
+
+    Returns (photos_written, extras_written).
+    """
     off = 4
     (count,) = struct.unpack_from(">I", data, off)
     off += 4
-    written = 0
+    photos = 0
+    extras = 0
     for _ in range(count):
         (name_len,) = struct.unpack_from(">H", data, off)
         off += 2
@@ -103,33 +115,51 @@ def unpack_bundle(data, out_dir):
         if len(blob) != data_len:
             raise ValueError("truncated bundle")
         safe = Path(name).name
-        if not safe or safe.startswith(".") or Path(safe).suffix.lower() not in (".jpg", ".jpeg"):
+        if safe != name or not safe or safe.startswith("."):
             raise ValueError("unexpected file name in bundle")
-        (out_dir / safe).write_bytes(blob)
-        written += 1
-    return written
+        if safe in GEO_FILES or safe == META_NAME:
+            if len(blob) > MAX_TEXT_BYTES:
+                raise ValueError(f"{safe} is too large")
+            blob.decode("utf-8")  # must be valid text
+            if safe == META_NAME:
+                if meta_out is None:
+                    continue
+                Path(meta_out).parent.mkdir(parents=True, exist_ok=True)
+                Path(meta_out).write_bytes(blob)
+            else:
+                (out_dir / safe).write_bytes(blob)
+            extras += 1
+        elif Path(safe).suffix.lower() in (".jpg", ".jpeg"):
+            (out_dir / safe).write_bytes(blob)
+            photos += 1
+        else:
+            raise ValueError("unexpected file name in bundle")
+    return photos, extras
 
 
-def decrypt_dir(src_dir, dst_dir, ext, key):
-    """Decrypt every *.enc. Each file is either a single photo or a photo bundle (S3DB)."""
+def decrypt_dir(src_dir, dst_dir, ext, key, meta_out=None):
+    """Decrypt every *.enc. Each file is either a single photo or a bundle (S3DB)."""
     out = Path(dst_dir)
     out.mkdir(parents=True, exist_ok=True)
     files = sorted(Path(src_dir).glob("*.enc"))
     if not files:
         sys.exit("no .enc files found")
     tmp = out / ".decrypt.tmp"
-    total = 0
+    photos = 0
+    extras = 0
     for f in files:
         decrypt_file(f, tmp, key)
         with open(tmp, "rb") as fh:
             magic = fh.read(4)
         if magic == BUNDLE_MAGIC:
-            total += unpack_bundle(tmp.read_bytes(), out)
+            p, e = unpack_bundle(tmp.read_bytes(), out, meta_out)
+            photos += p
+            extras += e
             tmp.unlink()
         else:
             tmp.rename(out / (f.stem + ext))
-            total += 1
-    print(f"decrypted {len(files)} files -> {total} photos")
+            photos += 1
+    print(f"decrypted {len(files)} files -> {photos} photos, {extras} extra files")
 
 
 def main():
@@ -150,6 +180,7 @@ def main():
     dd.add_argument("src_dir")
     dd.add_argument("dst_dir")
     dd.add_argument("--ext", default=".jpg")
+    dd.add_argument("--meta-out", default=None, help="where to write job.json if a bundle carries it")
 
     ed = sub.add_parser("encrypt-dir", help="encrypt every jpg in a folder to NNNN.enc (for tests)")
     ed.add_argument("src_dir")
@@ -168,7 +199,7 @@ def main():
     elif a.cmd == "decrypt":
         decrypt_file(a.src, a.dst, key)
     elif a.cmd == "decrypt-dir":
-        decrypt_dir(a.src_dir, a.dst_dir, a.ext, key)
+        decrypt_dir(a.src_dir, a.dst_dir, a.ext, key, a.meta_out)
     elif a.cmd == "encrypt-dir":
         out = Path(a.dst_dir)
         out.mkdir(parents=True, exist_ok=True)
