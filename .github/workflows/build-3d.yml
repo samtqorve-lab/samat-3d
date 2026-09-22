@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       odm_options:
-        description: "ODM options (empty = low-resource defaults)"
+        description: "ODM options (empty = chosen automatically from the job settings)"
         required: false
         default: ""
         type: string
@@ -74,28 +74,29 @@ jobs:
 
       - name: Decrypt photos
         run: |
-          pip install --quiet cryptography
+          # cryptography may already be present; otherwise install it (24.04 images may need --break-system-packages)
+          python3 -c "import cryptography" 2>/dev/null || python3 -m pip install --quiet cryptography || python3 -m pip install --quiet --break-system-packages cryptography
           mkdir -p work/project/images
-          python scripts/s3d.py decrypt-dir work/enc work/project/images --ext .jpg
-          echo "IMAGES=$(ls work/project/images | wc -l)" >> "$GITHUB_ENV"
+          python3 scripts/s3d.py decrypt-dir work/enc work/project/images --ext .jpg --meta-out work/job.json
+          echo "IMAGES=$(find work/project/images -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' \) | wc -l)" >> "$GITHUB_ENV"
           rm -rf work/enc
 
-      - name: Run OpenDroneMap
+      - name: Prepare ODM options
         env:
           ODM_OPTIONS: ${{ inputs.odm_options }}
         run: |
-          DEFAULTS="--pc-quality low --feature-quality low --mesh-size 100000 --mesh-octree-depth 10 --skip-orthophoto --skip-report --gltf --max-concurrency 4"
-          OPTS="${ODM_OPTIONS:-$DEFAULTS}"
-          docker run --rm -v "$PWD/work:/datasets" "$ODM_IMAGE" --project-path /datasets project $OPTS
+          python3 scripts/odm_options.py --job work/job.json --images work/project/images --override "$ODM_OPTIONS" > work/odm_options.txt
+          echo "ODM options: $(cat work/odm_options.txt)"
 
-      - name: Encrypt model and publish
+      - name: Run OpenDroneMap
         run: |
-          glb=$(find work/project -name '*_geo.glb' | head -n1)
-          [ -n "$glb" ] || glb=$(find work/project -name '*.glb' | head -n1)
-          [ -n "$glb" ] || { echo "ODM produced no .glb"; exit 1; }
-          python scripts/s3d.py encrypt "$glb" work/model.glb.enc
-          gh release create "$OUT_TAG" work/model.glb.enc \
-            --repo "$GITHUB_REPOSITORY" --title "$OUT_TAG" --notes "encrypted model"
+          docker run --rm -v "$PWD/work:/datasets" "$ODM_IMAGE" --project-path /datasets project $(cat work/odm_options.txt)
+
+      - name: Encrypt outputs and publish
+        run: |
+          python3 scripts/publish.py --project work/project --out work/out --job work/job.json
+          gh release create "$OUT_TAG" work/out/*.enc \
+            --repo "$GITHUB_REPOSITORY" --title "$OUT_TAG" --notes "encrypted outputs"
 
       - name: Delete raw photos
         run: |
@@ -110,9 +111,12 @@ jobs:
         run: |
           [ -n "$CALLBACK_URL" ] || { echo "no callback configured"; exit 0; }
           status=$([ "$JOB_STATUS" = success ] && echo done || echo failed)
+          assets=$(cat work/out/assets.json 2>/dev/null || echo '[]')
+          summary=$(cat work/out/summary.json 2>/dev/null || echo '{}')
           body=$(jq -n --arg id "$JOB_ID" --arg st "$status" --arg tag "$OUT_TAG" \
             --arg run "$GITHUB_RUN_ID" --argjson n "${IMAGES:-0}" \
-            '{job_id:$id,status:$st,model_tag:$tag,model_asset:"model.glb.enc",images:$n,run_id:$run}')
+            --argjson assets "$assets" --argjson summary "$summary" \
+            '{job_id:$id,status:$st,model_tag:$tag,images:$n,run_id:$run,assets:$assets,summary:$summary}')
           curl -fsS -X POST "$CALLBACK_URL" \
             -H "Authorization: Bearer $CALLBACK_TOKEN" \
             -H "Content-Type: application/json" -d "$body" || true
