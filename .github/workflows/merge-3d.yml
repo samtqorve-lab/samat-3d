@@ -1,0 +1,143 @@
+name: merge-3d
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_ids:
+        description: "Space- or comma-separated job_ids of already-built flights to merge (2 or more)"
+        required: true
+        type: string
+      merge_job_id:
+        description: "New job id for the merged result (16-32 lowercase hex chars, same convention as a flight job_id)"
+        required: true
+        type: string
+      crs:
+        description: "Target EPSG code, e.g. EPSG:32638 (empty = use the first flight's own CRS)"
+        required: false
+        default: ""
+        type: string
+      resampling:
+        description: "GDAL resampling method for the mosaic"
+        required: false
+        default: "cubic"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: merge-3d-${{ inputs.merge_job_id }}
+  cancel-in-progress: false
+
+env:
+  MERGE_JOB_ID: ${{ inputs.merge_job_id }}
+  OUT_TAG: model-${{ inputs.merge_job_id }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate ids
+        id: ids
+        run: |
+          [[ "$MERGE_JOB_ID" =~ ^[a-f0-9]{16,32}$ ]] || { echo "invalid merge_job_id"; exit 1; }
+          ids=$(echo "${{ inputs.job_ids }}" | tr ',' ' ')
+          count=0
+          for id in $ids; do
+            [[ "$id" =~ ^[a-f0-9]{16,32}$ ]] || { echo "invalid job id: $id"; exit 1; }
+            count=$((count+1))
+          done
+          [ "$count" -ge 2 ] || { echo "need at least 2 job_ids to merge (got $count)"; exit 1; }
+          echo "ids=$ids" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install GDAL and cryptography
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq gdal-bin
+          python3 -c "import cryptography" 2>/dev/null || python3 -m pip install --quiet cryptography || python3 -m pip install --quiet --break-system-packages cryptography
+
+      - name: Download and decrypt each flight's dsm/ortho
+        env:
+          KEY_URL: ${{ secrets.KEY_URL }}
+          KEY_TOKEN: ${{ secrets.KEY_TOKEN }}
+          TEST_KEY_B64: ${{ secrets.TEST_KEY_B64 }}
+        run: |
+          mkdir -p work/flights
+          for id in ${{ steps.ids.outputs.ids }}; do
+            echo "== flight $id =="
+            if [ -n "$KEY_URL" ]; then
+              resp=$(curl -fsS -X POST "$KEY_URL" \
+                -H "Authorization: Bearer $KEY_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"job_id\":\"$id\"}")
+              key=$(printf '%s' "$resp" | jq -r '.key_b64 // empty')
+            else
+              key="$TEST_KEY_B64"
+            fi
+            [ -n "$key" ] || { echo "no key available for flight $id"; exit 1; }
+            echo "::add-mask::$key"
+            mkdir -p "work/enc_$id" "work/flights/$id"
+            gh release download "model-$id" --repo "$GITHUB_REPOSITORY" --dir "work/enc_$id" --pattern '*.enc' \
+              || { echo "no model-$id release found — has that flight finished processing?"; exit 1; }
+            [ -f "work/enc_$id/dsm.tif.enc" ] || { echo "flight $id has no dsm.tif — it must be a completed 'survey' mode job"; exit 1; }
+            S3D_KEY_B64="$key" python3 scripts/s3d.py decrypt "work/enc_$id/dsm.tif.enc" "work/flights/$id/dsm.tif"
+            if [ -f "work/enc_$id/ortho.tif.enc" ]; then
+              S3D_KEY_B64="$key" python3 scripts/s3d.py decrypt "work/enc_$id/ortho.tif.enc" "work/flights/$id/ortho.tif"
+            fi
+            rm -rf "work/enc_$id"
+          done
+
+      - name: Merge flights
+        run: |
+          python3 scripts/merge_flights.py --flights work/flights --out work/merge_out \
+            ${{ inputs.crs != '' && format('--crs {0}', inputs.crs) || '' }} \
+            --resampling "${{ inputs.resampling }}"
+
+      - name: Encrypt merged outputs and publish
+        env:
+          KEY_URL: ${{ secrets.KEY_URL }}
+          KEY_TOKEN: ${{ secrets.KEY_TOKEN }}
+          TEST_KEY_B64: ${{ secrets.TEST_KEY_B64 }}
+        run: |
+          if [ -n "$KEY_URL" ]; then
+            resp=$(curl -fsS -X POST "$KEY_URL" \
+              -H "Authorization: Bearer $KEY_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"job_id\":\"$MERGE_JOB_ID\"}")
+            key=$(printf '%s' "$resp" | jq -r '.key_b64 // empty')
+          else
+            key="$TEST_KEY_B64"
+          fi
+          [ -n "$key" ] || { echo "no key available for merge job $MERGE_JOB_ID"; exit 1; }
+          echo "::add-mask::$key"
+          for f in work/merge_out/*.tif; do
+            S3D_KEY_B64="$key" python3 scripts/s3d.py encrypt "$f" "$f.enc"
+          done
+          gh release create "$OUT_TAG" work/merge_out/*.enc \
+            --repo "$GITHUB_REPOSITORY" --title "$OUT_TAG" --notes "merged outputs (${{ steps.ids.outputs.ids }})"
+
+      - name: Notify app
+        if: always()
+        env:
+          CALLBACK_URL: ${{ secrets.CALLBACK_URL }}
+          CALLBACK_TOKEN: ${{ secrets.CALLBACK_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          [ -n "$CALLBACK_URL" ] || { echo "no callback configured"; exit 0; }
+          status=$([ "$JOB_STATUS" = success ] && echo done || echo failed)
+          assets=$(cat work/merge_out/assets.json 2>/dev/null || echo '[]')
+          summary=$(cat work/merge_out/summary.json 2>/dev/null || echo '{}')
+          body=$(jq -n --arg id "$MERGE_JOB_ID" --arg st "$status" --arg tag "$OUT_TAG" \
+            --arg run "$GITHUB_RUN_ID" --argjson assets "$assets" --argjson summary "$summary" \
+            '{job_id:$id,status:$st,model_tag:$tag,run_id:$run,assets:$assets,summary:$summary,kind:"merge"}')
+          curl -fsS -X POST "$CALLBACK_URL" \
+            -H "Authorization: Bearer $CALLBACK_TOKEN" \
+            -H "Content-Type: application/json" -d "$body" || true
