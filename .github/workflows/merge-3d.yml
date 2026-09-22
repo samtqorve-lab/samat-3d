@@ -17,9 +17,14 @@ on:
         default: ""
         type: string
       resampling:
-        description: "GDAL resampling method for the mosaic"
+        description: "GDAL resampling method for the raster mosaic"
         required: false
         default: "cubic"
+        type: string
+      build_mesh:
+        description: "Also build a textured model.glb for the whole merged site (slower)"
+        required: false
+        default: "true"
         type: string
 
 permissions:
@@ -59,10 +64,11 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
           df -h /
 
-      - name: Install GDAL and cryptography
+      - name: Install GDAL and Python deps
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq gdal-bin
-          python3 -c "import cryptography" 2>/dev/null || python3 -m pip install --quiet cryptography || python3 -m pip install --quiet --break-system-packages cryptography
+          PIP="python3 -m pip install --quiet"
+          $PIP cryptography numpy pillow trimesh || $PIP --break-system-packages cryptography numpy pillow trimesh
 
       - name: Download and decrypt each flight's dsm/ortho
         env:
@@ -95,11 +101,22 @@ jobs:
             rm -rf "work/enc_$id"
           done
 
-      - name: Merge flights
+      - name: Merge flights (DSM + orthophoto mosaic)
         run: |
           python3 scripts/merge_flights.py --flights work/flights --out work/merge_out \
             ${{ inputs.crs != '' && format('--crs {0}', inputs.crs) || '' }} \
             --resampling "${{ inputs.resampling }}"
+
+      - name: Build merged 3D mesh (whole site)
+        if: inputs.build_mesh != 'false'
+        run: |
+          ortho_arg=""
+          [ -f work/merge_out/ortho.tif ] && ortho_arg="--ortho work/merge_out/ortho.tif"
+          python3 scripts/build_mesh_from_raster.py \
+            --dsm work/merge_out/dsm.tif $ortho_arg \
+            --out work/merge_out/model.glb
+          tmp=$(mktemp)
+          jq '. + ["model.glb"]' work/merge_out/assets.json > "$tmp" && mv "$tmp" work/merge_out/assets.json
 
       - name: Encrypt merged outputs and publish
         env:
@@ -118,7 +135,8 @@ jobs:
           fi
           [ -n "$key" ] || { echo "no key available for merge job $MERGE_JOB_ID"; exit 1; }
           echo "::add-mask::$key"
-          for f in work/merge_out/*.tif; do
+          for f in work/merge_out/*.tif work/merge_out/*.glb; do
+            [ -f "$f" ] || continue
             S3D_KEY_B64="$key" python3 scripts/s3d.py encrypt "$f" "$f.enc"
           done
           gh release create "$OUT_TAG" work/merge_out/*.enc \
