@@ -10,12 +10,13 @@ Reads the key from S3D_KEY_B64 (same as s3d.py). Writes into --out:
   stats.json.enc  ODM report data (accuracy numbers, GCP errors)
   ortho.tif.enc   orthophoto (only if it was built and is small enough)
   assets.json     list of the produced names, e.g. ["model.glb", "dsm.tif"]
-  summary.json    small non-sensitive summary for the app (numbers only)
+  summary.json    small non-sensitive summary for the app (numbers + CRS code)
 
 Exit code 1 if the outputs required for the job's mode are missing.
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -55,6 +56,11 @@ def numeric_leaves(obj, depth=0):
 
 def summarize(stats_path, job):
     summary = {"mode": job.get("mode", "preview"), "georef": job.get("georef", "exif")}
+    crs = job.get("crs")
+    # crs is a plain coordinate-system code (e.g. "EPSG:32638"), not sensitive; kept as-is
+    # (not numeric) so the merge-3d workflow and the app can tell flights apart/compatible.
+    if isinstance(crs, str) and re.fullmatch(r"EPSG:\d{4,6}", crs):
+        summary["crs"] = crs
     if not stats_path:
         return summary
     try:
