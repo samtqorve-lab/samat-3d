@@ -1,0 +1,37 @@
+name: cleanup-stale-photos
+
+# Safety net: deletes raw-photo releases (tag "in-<job_id>") that are more than
+# 2 days old. A successful build-3d.yml run already deletes its own "in-<job_id>"
+# release once the model is published — this only catches jobs that failed,
+# stalled, or were never picked up, so their raw photos don't sit around forever
+# in this public repo.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # daily at 03:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete stale in-* releases (older than 2 days)
+        run: |
+          cutoff=$(date -u -d '2 days ago' +%s)
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 500 \
+            --json tagName,publishedAt,createdAt \
+            --jq '.[] | select(.tagName | startswith("in-")) | [.tagName, (.publishedAt // .createdAt)] | @tsv' \
+          | while IFS=$'\t' read -r tag published; do
+              [ -z "$published" ] && continue
+              rel_ts=$(date -u -d "$published" +%s 2>/dev/null || echo 0)
+              if [ "$rel_ts" != "0" ] && [ "$rel_ts" -lt "$cutoff" ]; then
+                echo "deleting stale release: $tag (published $published)"
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+              fi
+            done
