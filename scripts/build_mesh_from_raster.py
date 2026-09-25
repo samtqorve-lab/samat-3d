@@ -1,32 +1,39 @@
 #!/usr/bin/env python3
-"""Build one lightweight textured glTF (.glb) mesh for the WHOLE merged mine site, from the
-merged DSM + orthophoto that merge_flights.py produces.
+"""Build lightweight textured glTF (.glb) meshes - a full-detail model.glb plus
+two decimated LOD levels (model_lod1.glb, model_lod2.glb; see lod.py) - for the
+WHOLE merged mine site, from the merged DSM + orthophoto that merge_flights.py
+produces.
 
-This is a heightmap mesh — a regular grid draped over the merged DSM, textured with the merged
-orthophoto — NOT a re-run of dense photogrammetry across all flights (that would mean fusing each
+This is a heightmap mesh - a regular grid draped over the merged DSM, textured with the merged
+orthophoto - NOT a re-run of dense photogrammetry across all flights (that would mean fusing each
 flight's raw point cloud with ICP alignment and re-meshing, which is out of scope here). It is
 good enough to fly over and inspect the whole pit, benches and haul roads at once. Per-flight
 photogrammetric detail (loose rock texture, small features, full point-cloud density) stays in
-each flight's own model.glb from build-3d.yml — that remains the higher-detail view for
+each flight's own model.glb from build-3d.yml - that remains the higher-detail view for
 close-up work; this merged mesh is the "whole mine at once" overview.
 
 Usage:
   build_mesh_from_raster.py --dsm work/merge_out/dsm.tif [--ortho work/merge_out/ortho.tif] \
-      --out work/merge_out/model.glb [--max-vertices-per-side 400] [--texture-size 2048]
+      --out work/merge_out/model.glb [--max-vertices-per-side 400] [--texture-size 2048] \
+      [--assets-json work/merge_out/assets.json]
 
 Requires the GDAL command-line tools (already installed by merge-3d.yml) plus the Python
-packages numpy, pillow and trimesh. Reads elevation via `gdal_translate -of XYZ` (plain text) —
+packages numpy, pillow and trimesh. Reads elevation via `gdal_translate -of XYZ` (plain text) -
 deliberately avoids the Python GDAL bindings, which are painful to install reliably via pip;
 gdal-bin's CLI tools are already on the runner.
 
 KNOWN LIMITATIONS (documented, not silently glossed over):
   - Mesh resolution is capped by --max-vertices-per-side (default 400x400 = up to 320k
-    triangles) — coarser than a native ODM photogrammetric mesh of one flight.
+    triangles) - coarser than a native ODM photogrammetric mesh of one flight.
   - The texture is the same simple mosaic merge_flights.py produces (no seamline blending),
     so a seam may be visible where two flights overlap.
   - Vertical axis convention matches ODM's own georeferenced .glb (Z = elevation) rather than
-    glTF's own Y-up convention, exactly like the per-flight model.glb — model3dViewer.js in the
+    glTF's own Y-up convention, exactly like the per-flight model.glb - model3dViewer.js in the
     app already detects and corrects this the same way it does for a single flight's model.
+  - model_lod1.glb/model_lod2.glb are geometry-only quadric decimations of the same mesh;
+    texture UV correspondence after heavy decimation is not guaranteed to look clean up close,
+    so they are meant for distant/overview rendering, not close-up inspection (use model.glb
+    for that).
 """
 import argparse
 import json
@@ -36,6 +43,9 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lod import write_with_lods  # noqa: E402
 
 
 def run(cmd):
@@ -115,6 +125,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-vertices-per-side", type=int, default=400)
     ap.add_argument("--texture-size", type=int, default=2048)
+    ap.add_argument("--assets-json", default=None,
+                     help="if given, append produced file names (model.glb + LODs) to this JSON array file")
     a = ap.parse_args()
 
     import trimesh  # imported late so --help works even without it installed
@@ -141,7 +153,7 @@ def main():
         v = 1.0 - (gy - ortho_bounds["minY"]) / max(1e-6, (ortho_bounds["maxY"] - ortho_bounds["minY"]))
         uv = np.stack([u.ravel(), v.ravel()], axis=1)
     else:
-        print("note: no orthophoto given — mesh will be untextured", file=sys.stderr)
+        print("note: no orthophoto given - mesh will be untextured", file=sys.stderr)
 
     vertices = np.stack([
         (gx - origin[0]).ravel(),
@@ -171,10 +183,14 @@ def main():
     else:
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    mesh.export(str(out_path), file_type="glb")
-    print(f"mesh: {len(vertices)} vertices, {len(faces)} triangles -> {out_path}"
+    written = write_with_lods(mesh, out_path)
+    print(f"mesh: {len(vertices)} vertices, {len(faces)} triangles -> {', '.join(written)}"
           f"{' (textured)' if texture is not None else ' (untextured)'}")
+
+    if a.assets_json:
+        p = Path(a.assets_json)
+        existing = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+        p.write_text(json.dumps(existing + written), encoding="utf-8")
 
     for p in tmp.glob("*"):
         p.unlink()

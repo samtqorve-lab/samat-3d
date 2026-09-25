@@ -11,7 +11,8 @@ The app puts a small job.json in the encrypted upload:
     "demResolution": 5,                     # cm/pixel of the DSM (survey)
     "quality": "standard" | "high",         # survey only
     "ortho": false,                         # also build the orthophoto (survey)
-    "crs": "EPSG:32638"                     # optional output CRS
+    "crs": "EPSG:32638",                    # optional output CRS
+    "referenceElevation": 1234.5            # optional: design floor (m) for volume.py cut/fill (survey only)
   }
 
 Usage:
