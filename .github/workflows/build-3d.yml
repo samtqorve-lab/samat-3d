@@ -12,6 +12,11 @@ on:
         required: false
         default: ""
         type: string
+      contour_interval:
+        description: "Contour interval in meters for the DXF export (survey mode only)"
+        required: false
+        default: "1"
+        type: string
 
 permissions:
   contents: write
@@ -25,7 +30,7 @@ env:
   IN_TAG: in-${{ inputs.job_id }}
   OUT_TAG: model-${{ inputs.job_id }}
   GH_TOKEN: ${{ github.token }}
-  ODM_IMAGE: opendronemap/odm:latest
+  ODM_IMAGE: opendronemap/odm:3.5.6
 
 jobs:
   build:
@@ -46,6 +51,11 @@ jobs:
           # swap is optional: if it fails, continue
           (sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile) || echo "swap setup skipped"
           free -h
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --quiet -r scripts/requirements.txt \
+            || python3 -m pip install --quiet --break-system-packages -r scripts/requirements.txt
 
       - name: Fetch encryption key
         env:
@@ -74,8 +84,6 @@ jobs:
 
       - name: Decrypt photos
         run: |
-          # cryptography may already be present; otherwise install it (24.04 images may need --break-system-packages)
-          python3 -c "import cryptography" 2>/dev/null || python3 -m pip install --quiet cryptography || python3 -m pip install --quiet --break-system-packages cryptography
           mkdir -p work/project/images
           python3 scripts/s3d.py decrypt-dir work/enc work/project/images --ext .jpg --meta-out work/job.json
           echo "IMAGES=$(find work/project/images -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' \) | wc -l)" >> "$GITHUB_ENV"
@@ -90,7 +98,42 @@ jobs:
 
       - name: Run OpenDroneMap
         run: |
-          docker run --rm -v "$PWD/work:/datasets" "$ODM_IMAGE" --project-path /datasets project $(cat work/odm_options.txt)
+          docker run --rm -v "$PWD/work:/datasets" "$ODM_IMAGE" --project-path /datasets project $(cat work/odm_options.txt) \
+            2>&1 | tee work/odm_run.log
+
+      - name: Run engineering analysis (survey mode only)
+        continue-on-error: true
+        run: |
+          mkdir -p work/project/analysis
+          MODE=$(python3 -c "import json; print(json.load(open('work/job.json')).get('mode','preview'))" 2>/dev/null || echo preview)
+          if [ "$MODE" != "survey" ]; then
+            echo "preview mode: skipping volume/report/contours"
+            exit 0
+          fi
+          DSM=work/project/odm_dem/dsm.tif
+          if [ ! -f "$DSM" ]; then
+            echo "no dsm.tif produced, skipping analysis"
+            exit 0
+          fi
+
+          REF_ELEV=$(python3 -c "import json; print(json.load(open('work/job.json')).get('referenceElevation',''))" 2>/dev/null)
+          if [ -n "$REF_ELEV" ]; then
+            python3 scripts/volume.py --dsm "$DSM" --reference-elevation "$REF_ELEV" \
+              --out work/project/analysis/volume.json \
+              || echo "warning: volume calculation failed, continuing without it"
+          fi
+
+          sudo apt-get update -qq && sudo apt-get install -y -qq gdal-bin
+          python3 scripts/export_engineering.py --dsm "$DSM" --out-dir work/project/analysis \
+            --interval "${{ inputs.contour_interval }}" \
+            || echo "warning: contour export failed, continuing without it"
+
+          VOL_ARG=""
+          [ -f work/project/analysis/volume.json ] && VOL_ARG="--volume work/project/analysis/volume.json"
+          python3 scripts/accuracy_report.py --dsm "$DSM" \
+            --stats work/project/odm_report/stats.json --job work/job.json \
+            $VOL_ARG --out work/project/analysis/report.pdf \
+            || echo "warning: report generation failed, continuing without it"
 
       - name: Encrypt outputs and publish
         run: |
@@ -113,10 +156,15 @@ jobs:
           status=$([ "$JOB_STATUS" = success ] && echo done || echo failed)
           assets=$(cat work/out/assets.json 2>/dev/null || echo '[]')
           summary=$(cat work/out/summary.json 2>/dev/null || echo '{}')
+          if [ "$status" = "failed" ]; then
+            error_tail=$(tail -c 4000 work/odm_run.log 2>/dev/null | jq -Rs . || echo 'null')
+          else
+            error_tail='null'
+          fi
           body=$(jq -n --arg id "$JOB_ID" --arg st "$status" --arg tag "$OUT_TAG" \
             --arg run "$GITHUB_RUN_ID" --argjson n "${IMAGES:-0}" \
-            --argjson assets "$assets" --argjson summary "$summary" \
-            '{job_id:$id,status:$st,model_tag:$tag,images:$n,run_id:$run,assets:$assets,summary:$summary}')
+            --argjson assets "$assets" --argjson summary "$summary" --argjson error_tail "$error_tail" \
+            '{job_id:$id,status:$st,model_tag:$tag,images:$n,run_id:$run,assets:$assets,summary:$summary,error_tail:$error_tail}')
           curl -fsS -X POST "$CALLBACK_URL" \
             -H "Authorization: Bearer $CALLBACK_TOKEN" \
             -H "Content-Type: application/json" -d "$body" || true
