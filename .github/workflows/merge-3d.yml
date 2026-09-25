@@ -22,9 +22,14 @@ on:
         default: "cubic"
         type: string
       build_mesh:
-        description: "Also build a textured model.glb for the whole merged site (slower)"
+        description: "Also build a textured model.glb (+ LOD levels) for the whole merged site (slower)"
         required: false
         default: "true"
+        type: string
+      reference_elevation:
+        description: "Optional design floor elevation (meters) to compute cut/fill volume against"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -68,7 +73,7 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq gdal-bin
           PIP="python3 -m pip install --quiet"
-          $PIP cryptography numpy pillow trimesh || $PIP --break-system-packages cryptography numpy pillow trimesh
+          $PIP -r scripts/requirements.txt || $PIP --break-system-packages -r scripts/requirements.txt
 
       - name: Download and decrypt each flight's dsm/ortho
         env:
@@ -92,8 +97,8 @@ jobs:
             echo "::add-mask::$key"
             mkdir -p "work/enc_$id" "work/flights/$id"
             gh release download "model-$id" --repo "$GITHUB_REPOSITORY" --dir "work/enc_$id" --pattern '*.enc' \
-              || { echo "no model-$id release found — has that flight finished processing?"; exit 1; }
-            [ -f "work/enc_$id/dsm.tif.enc" ] || { echo "flight $id has no dsm.tif — it must be a completed 'survey' mode job"; exit 1; }
+              || { echo "no model-$id release found - has that flight finished processing?"; exit 1; }
+            [ -f "work/enc_$id/dsm.tif.enc" ] || { echo "flight $id has no dsm.tif - it must be a completed 'survey' mode job"; exit 1; }
             S3D_KEY_B64="$key" python3 scripts/s3d.py decrypt "work/enc_$id/dsm.tif.enc" "work/flights/$id/dsm.tif"
             if [ -f "work/enc_$id/ortho.tif.enc" ]; then
               S3D_KEY_B64="$key" python3 scripts/s3d.py decrypt "work/enc_$id/ortho.tif.enc" "work/flights/$id/ortho.tif"
@@ -101,22 +106,77 @@ jobs:
             rm -rf "work/enc_$id"
           done
 
+      - name: Fetch previous merge result for change detection (if any)
+        continue-on-error: true
+        env:
+          KEY_URL: ${{ secrets.KEY_URL }}
+          KEY_TOKEN: ${{ secrets.KEY_TOKEN }}
+          TEST_KEY_B64: ${{ secrets.TEST_KEY_B64 }}
+        run: |
+          mkdir -p work/previous
+          if gh release download "$OUT_TAG" --repo "$GITHUB_REPOSITORY" --dir work/previous --pattern 'dsm.tif.enc' 2>/dev/null; then
+            if [ -n "$KEY_URL" ]; then
+              resp=$(curl -fsS -X POST "$KEY_URL" \
+                -H "Authorization: Bearer $KEY_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"job_id\":\"$MERGE_JOB_ID\"}")
+              key=$(printf '%s' "$resp" | jq -r '.key_b64 // empty')
+            else
+              key="$TEST_KEY_B64"
+            fi
+            if [ -n "$key" ]; then
+              echo "::add-mask::$key"
+              S3D_KEY_B64="$key" python3 scripts/s3d.py decrypt work/previous/dsm.tif.enc work/previous/dsm.tif
+              echo "HAVE_PREVIOUS=1" >> "$GITHUB_ENV"
+            else
+              echo "no key available for previous merge - skipping change detection"
+            fi
+          else
+            echo "no previous merge result for $MERGE_JOB_ID - first run, nothing to compare"
+          fi
+
       - name: Merge flights (DSM + orthophoto mosaic)
         run: |
           python3 scripts/merge_flights.py --flights work/flights --out work/merge_out \
             ${{ inputs.crs != '' && format('--crs {0}', inputs.crs) || '' }} \
-            --resampling "${{ inputs.resampling }}"
+            --resampling "${{ inputs.resampling }}" 2>&1 | tee work/merge_run.log
+
+      - name: Change detection vs previous merge
+        if: env.HAVE_PREVIOUS == '1'
+        continue-on-error: true
+        run: |
+          python3 scripts/change_detection.py --before work/previous/dsm.tif --after work/merge_out/dsm.tif \
+            --out work/merge_out/change_summary.json --diff-out work/merge_out/change.tif \
+            || echo "warning: change detection failed, continuing without it"
+
+      - name: Compute volume against a design elevation (optional)
+        if: inputs.reference_elevation != ''
+        continue-on-error: true
+        run: |
+          python3 scripts/volume.py --dsm work/merge_out/dsm.tif \
+            --reference-elevation "${{ inputs.reference_elevation }}" \
+            --out work/merge_out/volume.json \
+            || echo "warning: volume calculation failed, continuing without it"
+
+      - name: Fold volume/change results into summary
+        continue-on-error: true
+        run: |
+          extra="{}"
+          [ -f work/merge_out/volume.json ] && extra=$(jq -s '.[0] * {volume: .[1]}' <(echo "$extra") work/merge_out/volume.json)
+          [ -f work/merge_out/change_summary.json ] && extra=$(jq -s '.[0] * {change: .[1]}' <(echo "$extra") work/merge_out/change_summary.json)
+          tmp=$(mktemp)
+          jq -s '.[0] * .[1]' work/merge_out/summary.json <(echo "$extra") > "$tmp" && mv "$tmp" work/merge_out/summary.json
 
       - name: Build merged 3D mesh (whole site)
         if: inputs.build_mesh != 'false'
+        continue-on-error: true
         run: |
           ortho_arg=""
           [ -f work/merge_out/ortho.tif ] && ortho_arg="--ortho work/merge_out/ortho.tif"
           python3 scripts/build_mesh_from_raster.py \
             --dsm work/merge_out/dsm.tif $ortho_arg \
-            --out work/merge_out/model.glb
-          tmp=$(mktemp)
-          jq '. + ["model.glb"]' work/merge_out/assets.json > "$tmp" && mv "$tmp" work/merge_out/assets.json
+            --out work/merge_out/model.glb --assets-json work/merge_out/assets.json \
+            2>&1 | tee -a work/merge_run.log
 
       - name: Encrypt merged outputs and publish
         env:
@@ -139,6 +199,7 @@ jobs:
             [ -f "$f" ] || continue
             S3D_KEY_B64="$key" python3 scripts/s3d.py encrypt "$f" "$f.enc"
           done
+          gh release delete "$OUT_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
           gh release create "$OUT_TAG" work/merge_out/*.enc \
             --repo "$GITHUB_REPOSITORY" --title "$OUT_TAG" --notes "merged outputs (${{ steps.ids.outputs.ids }})"
 
@@ -153,9 +214,15 @@ jobs:
           status=$([ "$JOB_STATUS" = success ] && echo done || echo failed)
           assets=$(cat work/merge_out/assets.json 2>/dev/null || echo '[]')
           summary=$(cat work/merge_out/summary.json 2>/dev/null || echo '{}')
+          if [ "$status" = "failed" ]; then
+            error_tail=$(tail -c 4000 work/merge_run.log 2>/dev/null | jq -Rs . || echo 'null')
+          else
+            error_tail='null'
+          fi
           body=$(jq -n --arg id "$MERGE_JOB_ID" --arg st "$status" --arg tag "$OUT_TAG" \
             --arg run "$GITHUB_RUN_ID" --argjson assets "$assets" --argjson summary "$summary" \
-            '{job_id:$id,status:$st,model_tag:$tag,run_id:$run,assets:$assets,summary:$summary,kind:"merge"}')
+            --argjson error_tail "$error_tail" \
+            '{job_id:$id,status:$st,model_tag:$tag,run_id:$run,assets:$assets,summary:$summary,kind:"merge",error_tail:$error_tail}')
           curl -fsS -X POST "$CALLBACK_URL" \
             -H "Authorization: Bearer $CALLBACK_TOKEN" \
             -H "Content-Type: application/json" -d "$body" || true
