@@ -30,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from s3d import encrypt_file, load_key  # noqa: E402
+from glb_rtc import try_copy_rtc  # noqa: E402
 
 MAX_ASSET = 1_900_000_000      # GitHub release assets must stay under 2 GB
 MAX_ORTHO = 250_000_000        # the app downloads/decrypts in memory; keep the orthophoto modest
@@ -63,13 +64,36 @@ def numeric_leaves(obj, depth=0):
     return None
 
 
-def summarize(stats_path, job, volume_path=None):
+def crs_from_coords_txt(path):
+    """ODM's odm_georeferencing/coords.txt starts with a line like "WGS84 UTM 38N".
+    Returns "EPSG:32638" (north) / "EPSG:32738" (south) or None. Used only when the job did
+    not state a crs explicitly, so the app always knows the UTM zone of the model."""
+    if not path:
+        return None
+    try:
+        first = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[0]
+    except (OSError, IndexError):
+        return None
+    m = re.search(r"WGS\s*84\s+UTM\s+(\d{1,2})\s*([NS])", first, re.IGNORECASE)
+    if not m:
+        return None
+    zone = int(m.group(1))
+    if not 1 <= zone <= 60:
+        return None
+    return f"EPSG:{326 if m.group(2).upper() == 'N' else 327}{zone:02d}"
+
+
+def summarize(stats_path, job, volume_path=None, coords_path=None):
     summary = {"mode": job.get("mode", "preview"), "georef": job.get("georef", "exif")}
     crs = job.get("crs")
     # crs is a plain coordinate-system code (e.g. "EPSG:32638"), not sensitive; kept as-is
     # (not numeric) so the merge-3d workflow and the app can tell flights apart/compatible.
     if isinstance(crs, str) and re.fullmatch(r"EPSG:\d{4,6}", crs):
         summary["crs"] = crs
+    else:
+        detected = crs_from_coords_txt(coords_path)
+        if detected:
+            summary["crs"] = detected
     if stats_path:
         try:
             stats = json.loads(Path(stats_path).read_text(encoding="utf-8"))
@@ -118,6 +142,10 @@ def make_lods(glb_path, out_dir):
             written.append(name)
         except Exception as exc:
             print(f"warning: LOD {name} skipped ({exc})", file=sys.stderr)
+    # trimesh drops the CESIUM_RTC extension (the UTM origin of the model) when re-exporting;
+    # copy it from the full-detail model so the app can still place the light models on the map.
+    if written:
+        try_copy_rtc(glb_path, [Path(out_dir) / name for name in written])
     return written
 
 
@@ -150,6 +178,7 @@ def main():
     contours = find_first(analysis, ["contours.dxf"]) if analysis.exists() else None
     report = find_first(analysis, ["report.pdf"]) if analysis.exists() else None
     volume_json = analysis / "volume.json"
+    coords = find_first(project, ["odm_georeferencing/coords.txt", "**/odm_georeferencing/coords.txt"])
 
     if survey and dsm is None:
         print("error: survey job finished without odm_dem/dsm.tif", file=sys.stderr)
@@ -192,7 +221,8 @@ def main():
 
     (out / "assets.json").write_text(json.dumps(produced), encoding="utf-8")
     (out / "summary.json").write_text(
-        json.dumps(summarize(stats, job, volume_json if volume_json.exists() else None)), encoding="utf-8")
+        json.dumps(summarize(stats, job, volume_json if volume_json.exists() else None, coords)),
+        encoding="utf-8")
     print("assets:", ", ".join(produced))
 
     # tidy up: only *.enc, assets.json and summary.json should remain in --out
