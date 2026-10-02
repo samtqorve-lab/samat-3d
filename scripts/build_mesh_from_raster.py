@@ -46,6 +46,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lod import write_with_lods  # noqa: E402
+from glb_rtc import try_write_rtc  # noqa: E402
 
 
 def run(cmd):
@@ -184,6 +185,10 @@ def main():
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
     written = write_with_lods(mesh, out_path)
+    # Vertices are relative to `origin` (bbox center, lowest elevation). Record that origin as
+    # CESIUM_RTC center - same convention ODM uses for single flights - so the app can place the
+    # merged mesh on the map (UTM coordinates, license boundary, comparing flights).
+    try_write_rtc([out_path.parent / name for name in written], [float(origin[0]), float(origin[1]), float(origin[2])])
     print(f"mesh: {len(vertices)} vertices, {len(faces)} triangles -> {', '.join(written)}"
           f"{' (textured)' if texture is not None else ' (untextured)'}")
 
