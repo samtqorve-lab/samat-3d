@@ -1,5 +1,9 @@
 name: build-3d
 
+# run-name includes job_id so the model3d Edge Function can match a run to its job
+# and mark the job failed right away when the run is cancelled/fails without a callback.
+run-name: build-3d ${{ inputs.job_id }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -103,6 +107,8 @@ jobs:
 
       - name: Run engineering analysis (survey mode only)
         continue-on-error: true
+        # the analysis is optional: it must never be able to hang the run (and lose the ODM result)
+        timeout-minutes: 25
         run: |
           mkdir -p work/project/analysis
           MODE=$(python3 -c "import json; print(json.load(open('work/job.json')).get('mode','preview'))" 2>/dev/null || echo preview)
