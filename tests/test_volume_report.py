@@ -119,3 +119,27 @@ def test_preview_never_upscales(tmp_path):
     write_dsm(dsm, z)
     prev, *_ = accuracy_report.read_preview(str(dsm), 2000)
     assert prev.shape == (30, 40)
+
+
+def test_contour_smoothing_shrinks_output_and_keeps_geometry(tmp_path):
+    import export_engineering
+
+    n = 800
+    yy, xx = np.mgrid[0:n, 0:n]
+    hill = 10 * np.exp(-(((xx - 400) / 250.0) ** 2 + ((yy - 400) / 250.0) ** 2))
+    z = (hill + np.random.default_rng(0).normal(0, 0.03, (n, n))).astype("float32")
+    dsm = tmp_path / "noisy.tif"
+    write_dsm(dsm, z, res=0.05)  # 40 x 40 m at 5 cm
+
+    smooth = tmp_path / "smooth.tif"
+    assert export_engineering.smoothed_dsm(str(dsm), str(smooth), 0.5) is True
+    with rasterio.open(smooth) as s, rasterio.open(dsm) as o:
+        assert s.width == pytest.approx(o.width / 10, abs=1)
+        assert s.bounds.left == pytest.approx(o.bounds.left)
+        assert s.bounds.top == pytest.approx(o.bounds.top)
+        assert s.bounds.right == pytest.approx(o.bounds.right, abs=0.3)
+        assert float(s.read(1).max()) == pytest.approx(10.0, abs=0.2)  # peak preserved
+
+    # already coarse enough, or smoothing disabled -> no copy
+    assert export_engineering.smoothed_dsm(str(dsm), str(tmp_path / "x.tif"), 0.01) is False
+    assert export_engineering.smoothed_dsm(str(dsm), str(tmp_path / "y.tif"), 0) is False
