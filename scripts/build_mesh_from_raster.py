@@ -22,6 +22,11 @@ packages numpy, pillow and trimesh. Reads elevation via `gdal_translate -of XYZ`
 deliberately avoids the Python GDAL bindings, which are painful to install reliably via pip;
 gdal-bin's CLI tools are already on the runner.
 
+NODATA HANDLING: cells that are nodata (declared nodata value, NaN, or an implausible sentinel
+such as -9999) get no triangles, and their vertices are pinned to the lowest valid elevation so
+they cannot stretch the mesh's bounding box (which would break camera framing in the viewer and
+the LOD decimation).
+
 KNOWN LIMITATIONS (documented, not silently glossed over):
   - Mesh resolution is capped by --max-vertices-per-side (default 400x400 = up to 320k
     triangles) - coarser than a native ODM photogrammetric mesh of one flight.
@@ -47,6 +52,8 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lod import write_with_lods  # noqa: E402
 from glb_rtc import try_write_rtc  # noqa: E402
+
+IMPLAUSIBLE_LOW_Z = -9000.0  # below this is a nodata sentinel (e.g. -9999), never real terrain
 
 
 def run(cmd):
@@ -79,8 +86,11 @@ def read_grid(dsm_path, max_side, tmp_dir):
     small_info = gdalinfo(small)
     nodata = None
     bands = small_info.get("bands", [])
-    if bands and "noDataValue" in bands[0]:
-        nodata = bands[0]["noDataValue"]
+    if bands and bands[0].get("noDataValue") is not None:
+        try:
+            nodata = float(bands[0]["noDataValue"])  # gdalinfo may report "NaN" as a string
+        except (TypeError, ValueError):
+            nodata = None
     xyz = tmp_dir / "dsm_small.xyz"
     run(["gdal_translate", "-of", "XYZ", str(small), str(xyz)])
     xs, ys, zs = [], [], []
@@ -99,8 +109,8 @@ def read_grid(dsm_path, max_side, tmp_dir):
     grid_x = np.array(xs, dtype=np.float64).reshape(out_h, out_w)
     grid_y = np.array(ys, dtype=np.float64).reshape(out_h, out_w)
     grid_z = np.array(zs, dtype=np.float64).reshape(out_h, out_w)
-    valid = np.ones((out_h, out_w), dtype=bool)
-    if nodata is not None:
+    valid = np.isfinite(grid_z) & (grid_z > IMPLAUSIBLE_LOW_Z)
+    if nodata is not None and np.isfinite(nodata):
         valid &= ~np.isclose(grid_z, nodata)
     return grid_x, grid_y, grid_z, valid, bounds_of(small_info)
 
@@ -139,12 +149,18 @@ def main():
     gx, gy, gz, valid, _dsm_bounds = read_grid(Path(a.dsm), a.max_vertices_per_side, tmp)
     h, w = gz.shape
 
+    if not valid.any():
+        sys.exit("error: merged DSM has no valid elevation cells (all nodata?)")
+
     valid_z = np.where(valid, gz, np.nan)
     origin = np.array([
         float(np.nanmin(gx)) / 2 + float(np.nanmax(gx)) / 2,
         float(np.nanmin(gy)) / 2 + float(np.nanmax(gy)) / 2,
         float(np.nanmin(valid_z)),
     ])
+    # pin nodata vertices to the lowest valid elevation: they get no triangles, but a -9999
+    # left in the vertex array would still blow up the bounding box
+    gz = np.where(valid, gz, origin[2])
 
     texture = None
     uv = None
@@ -162,20 +178,17 @@ def main():
         (gz - origin[2]).ravel(),
     ], axis=1)
 
-    faces = []
-    for r in range(h - 1):
-        for c in range(w - 1):
-            if not (valid[r, c] and valid[r, c + 1] and valid[r + 1, c] and valid[r + 1, c + 1]):
-                continue
-            i00 = r * w + c
-            i01 = r * w + c + 1
-            i10 = (r + 1) * w + c
-            i11 = (r + 1) * w + c + 1
-            faces.append([i00, i10, i11])
-            faces.append([i00, i11, i01])
-    if not faces:
+    # two triangles per grid cell whose four corners are all valid (vectorised)
+    idx = np.arange(h * w, dtype=np.int64).reshape(h, w)
+    ok = valid[:-1, :-1] & valid[:-1, 1:] & valid[1:, :-1] & valid[1:, 1:]
+    i00 = idx[:-1, :-1][ok]
+    i01 = idx[:-1, 1:][ok]
+    i10 = idx[1:, :-1][ok]
+    i11 = idx[1:, 1:][ok]
+    if i00.size == 0:
         sys.exit("error: merged DSM produced no valid mesh triangles (all nodata?)")
-    faces = np.array(faces, dtype=np.int64)
+    faces = np.concatenate([np.stack([i00, i10, i11], axis=1),
+                            np.stack([i00, i11, i01], axis=1)])
 
     if texture is not None:
         material = trimesh.visual.texture.SimpleMaterial(image=texture)
