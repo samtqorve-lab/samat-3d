@@ -96,8 +96,10 @@ jobs:
             [ -n "$key" ] || { echo "no key available for flight $id"; exit 1; }
             echo "::add-mask::$key"
             mkdir -p "work/enc_$id" "work/flights/$id"
-            gh release download "model-$id" --repo "$GITHUB_REPOSITORY" --dir "work/enc_$id" --pattern '*.enc' \
-              || { echo "no model-$id release found - has that flight finished processing?"; exit 1; }
+            # only the DSM and orthophoto are needed - skip model.glb / point cloud / etc. (can be GBs)
+            gh release download "model-$id" --repo "$GITHUB_REPOSITORY" --dir "work/enc_$id" \
+              --pattern 'dsm.tif.enc' --pattern 'ortho.tif.enc' \
+              || { echo "no model-$id release (or no dsm.tif.enc in it) - has that flight finished processing in survey mode?"; exit 1; }
             [ -f "work/enc_$id/dsm.tif.enc" ] || { echo "flight $id has no dsm.tif - it must be a completed 'survey' mode job"; exit 1; }
             S3D_KEY_B64="$key" python3 scripts/s3d.py decrypt "work/enc_$id/dsm.tif.enc" "work/flights/$id/dsm.tif"
             if [ -f "work/enc_$id/ortho.tif.enc" ]; then
@@ -105,6 +107,7 @@ jobs:
             fi
             rm -rf "work/enc_$id"
           done
+          df -h /
 
       - name: Fetch previous merge result for change detection (if any)
         continue-on-error: true
@@ -136,10 +139,15 @@ jobs:
           fi
 
       - name: Merge flights (DSM + orthophoto mosaic)
+        shell: bash
         run: |
+          set -eo pipefail
+          mkdir -p work
           python3 scripts/merge_flights.py --flights work/flights --out work/merge_out \
             ${{ inputs.crs != '' && format('--crs {0}', inputs.crs) || '' }} \
             --resampling "${{ inputs.resampling }}" 2>&1 | tee work/merge_run.log
+          [ -f work/merge_out/dsm.tif ] || { echo "merge produced no dsm.tif"; exit 1; }
+          df -h /
 
       - name: Change detection vs previous merge
         if: env.HAVE_PREVIOUS == '1'
@@ -169,14 +177,31 @@ jobs:
 
       - name: Build merged 3D mesh (whole site)
         if: inputs.build_mesh != 'false'
-        continue-on-error: true
+        shell: bash
         run: |
+          # a mesh failure must not lose the DSM/ortho, but it must be visible (not silently "done")
+          set +e
+          set -o pipefail
           ortho_arg=""
           [ -f work/merge_out/ortho.tif ] && ortho_arg="--ortho work/merge_out/ortho.tif"
           python3 scripts/build_mesh_from_raster.py \
             --dsm work/merge_out/dsm.tif $ortho_arg \
             --out work/merge_out/model.glb --assets-json work/merge_out/assets.json \
             2>&1 | tee -a work/merge_run.log
+          if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+            echo "::warning::3D mesh build failed - merged DSM/ortho will still be published, but without model.glb"
+            echo "MESH_FAILED=1" >> "$GITHUB_ENV"
+            rm -f work/merge_out/model*.glb
+          fi
+          exit 0
+
+      - name: Record mesh failure in summary
+        if: env.MESH_FAILED == '1'
+        continue-on-error: true
+        run: |
+          tail_txt=$(tail -c 600 work/merge_run.log 2>/dev/null || true)
+          tmp=$(mktemp)
+          jq --arg e "$tail_txt" '. + {meshFailed: true, meshError: $e}' work/merge_out/summary.json > "$tmp" && mv "$tmp" work/merge_out/summary.json
 
       - name: Encrypt merged outputs and publish
         env:
@@ -184,6 +209,7 @@ jobs:
           KEY_TOKEN: ${{ secrets.KEY_TOKEN }}
           TEST_KEY_B64: ${{ secrets.TEST_KEY_B64 }}
         run: |
+          [ -f work/merge_out/dsm.tif ] || { echo "nothing to publish: merged dsm.tif is missing (see the merge step log)"; exit 1; }
           if [ -n "$KEY_URL" ]; then
             resp=$(curl -fsS -X POST "$KEY_URL" \
               -H "Authorization: Bearer $KEY_TOKEN" \
