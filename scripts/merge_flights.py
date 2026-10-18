@@ -15,7 +15,8 @@ Expects, for two or more flights:
 
 Writes into --out:
   dsm.tif       merged elevation model, reprojected to one common CRS
-  ortho.tif     merged orthophoto (only produced if every flight has one)
+  ortho.tif     merged orthophoto (built from every flight that has one; flights without
+                an ortho.tif leave a gap there and are listed in summary.json warnings)
   assets.json   list of the produced names, e.g. ["dsm.tif", "ortho.tif"]
   summary.json  small non-sensitive summary: source job ids, CRS, size, bounds,
                 and any consistency warnings (see below)
@@ -30,14 +31,16 @@ CONSISTENCY CHECKS (best-effort, never fail the merge — they only warn):
     job_ids, or flights of unrelated sites) rather than a legitimately gapped site,
     so a warning is printed and recorded in summary.json.
   - Vertical consistency check: for any two flights whose footprints DO overlap, a
-    coarse elevation sample is compared in the overlap area. GDAL's reprojection
-    only corrects the HORIZONTAL coordinate system — it does not know about or fix
-    a vertical datum mismatch (e.g. one flight georeferenced with ellipsoidal GPS
-    heights, another tied to a local benchmark/orthometric elevation). A large
-    median offset between two overlapping flights is a strong sign of exactly that,
-    and would silently corrupt any cut/fill volume computed on the merged result —
+    coarse elevation sample is compared in the overlap area (nodata cells are ignored).
+    GDAL's reprojection only corrects the HORIZONTAL coordinate system — it does not
+    know about or fix a vertical datum mismatch (e.g. one flight georeferenced with
+    ellipsoidal GPS heights, another tied to a local benchmark/orthometric elevation).
+    A large median offset between two overlapping flights is a strong sign of exactly
+    that, and would silently corrupt any cut/fill volume computed on the merged result —
     so it is surfaced as a warning rather than left for someone to discover later
     in a wrong volume number.
+  - Partial orthophoto: if only some flights have an ortho.tif (it is skipped for very
+    large orthos), the merged ortho covers just those flights and a warning lists the rest.
 
 KNOWN LIMITATION: this is a straightforward raster mosaic (last-pixel-wins on
 overlaps), not a proper orthomosaic — there is no seamline feathering or
@@ -48,12 +51,14 @@ blend is future work.
 import argparse
 import json
 import math
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 OVERLAP_VERTICAL_WARN_M = 0.5   # median elevation offset in an overlap area worth flagging
 SAMPLE_GRID = 40                # coarse sample grid size (per side) for the vertical check
+IMPLAUSIBLE_LOW_Z = -9000.0     # anything below this is a nodata sentinel (e.g. -9999), not terrain
 
 
 def run(cmd):
@@ -64,8 +69,23 @@ def run(cmd):
 
 
 def srs_of(path):
+    """EPSG code of a raster ("EPSG:32638") when it has a recognised one, otherwise its
+    WKT (still good enough as a reprojection SOURCE, but not as the merged output CRS)."""
     out = run(["gdalsrsinfo", "-o", "epsg", str(path)]).strip()
-    return out or None
+    if out.upper().startswith("EPSG:") and "-1" not in out:
+        return out
+    wkt = run(["gdalsrsinfo", "-o", "wkt2", str(path)]).strip()
+    return wkt or None
+
+
+def nodata_of(path):
+    try:
+        bands = json.loads(run(["gdalinfo", "-json", str(path)])).get("bands", [])
+        if bands and bands[0].get("noDataValue") is not None:
+            return float(bands[0]["noDataValue"])
+    except (ValueError, SystemExit):
+        pass
+    return None
 
 
 def find_flights(root):
@@ -86,16 +106,19 @@ def find_flights(root):
 
 def reproject_or_copy(src, dst, src_crs, target_crs, resampling):
     if src_crs == target_crs:
-        dst.write_bytes(src.read_bytes())
+        shutil.copyfile(src, dst)  # streamed copy - the DSM/ortho can be hundreds of MB
         return
     run(["gdalwarp", "-t_srs", target_crs, "-r", resampling, "-multi",
-         "-co", "COMPRESS=DEFLATE", "-overwrite", str(src), str(dst)])
+         "-wo", "NUM_THREADS=ALL_CPUS",
+         "-co", "COMPRESS=DEFLATE", "-co", "BIGTIFF=IF_SAFER", "-overwrite", str(src), str(dst)])
 
 
 def mosaic(sources, dst, tmp_dir, resampling):
     vrt = tmp_dir / f"{dst.stem}.vrt"
     run(["gdalbuildvrt", "-r", resampling, str(vrt), *[str(s) for s in sources]])
-    run(["gdal_translate", "-co", "COMPRESS=DEFLATE", "-co", "TILED=YES", str(vrt), str(dst)])
+    # BIGTIFF=IF_SAFER: a merged site can exceed the classic 4 GB TIFF limit
+    run(["gdal_translate", "-co", "COMPRESS=DEFLATE", "-co", "TILED=YES",
+         "-co", "BIGTIFF=IF_SAFER", "-co", "NUM_THREADS=ALL_CPUS", str(vrt), str(dst)])
 
 
 def bounds_of(path):
@@ -116,7 +139,9 @@ def bbox_overlap(a, b):
 def sample_elevations(path, minx, miny, maxx, maxy, tmp_dir, size=SAMPLE_GRID):
     """Coarse elevation sample of `path` over a window, as a flat list of z values
     (same grid size/order for any two calls with the same window, so two flights'
-    samples over the same overlap window line up cell-for-cell)."""
+    samples over the same overlap window line up cell-for-cell). Nodata cells come
+    back as NaN so they are ignored by the comparison."""
+    nd = nodata_of(path)
     xyz = tmp_dir / f"_sample_{Path(path).stem}_{abs(hash((minx, miny, maxx, maxy)))}.xyz"
     run(["gdal_translate", "-projwin", str(minx), str(maxy), str(maxx), str(miny),
          "-outsize", str(size), str(size), "-of", "XYZ", str(path), str(xyz)])
@@ -124,7 +149,10 @@ def sample_elevations(path, minx, miny, maxx, maxy, tmp_dir, size=SAMPLE_GRID):
     for line in xyz.read_text(encoding="utf-8").splitlines():
         parts = line.split()
         if len(parts) == 3:
-            zs.append(float(parts[2]))
+            z = float(parts[2])
+            is_nodata = (math.isnan(z) or z < IMPLAUSIBLE_LOW_Z
+                         or (nd is not None and not math.isnan(nd) and math.isclose(z, nd)))
+            zs.append(float("nan") if is_nodata else z)
     xyz.unlink(missing_ok=True)
     return zs
 
@@ -195,12 +223,20 @@ def main():
         crs_by_id[f["id"]] = crs
 
     target_crs = a.crs or crs_by_id[flights[0]["id"]]
+    if not target_crs.upper().startswith("EPSG:"):
+        sys.exit("error: the flights' coordinate system has no EPSG code, and the app needs one for "
+                  "the merged result — re-run merge-3d with the 'crs' input set, e.g. EPSG:32638")
 
-    have_ortho = all(f["ortho"] for f in flights)
-    if not have_ortho:
-        missing = [f["id"] for f in flights if not f["ortho"]]
-        print(f"note: {len(missing)} flight(s) have no ortho.tif ({', '.join(missing)}) — "
-              f"merged ortho.tif will be skipped", file=sys.stderr)
+    warnings = []
+    ortho_flights = [f for f in flights if f["ortho"]]
+    have_ortho = len(ortho_flights) >= 1
+    missing = [f["id"] for f in flights if not f["ortho"]]
+    if missing and have_ortho:
+        print(f"warning: {len(missing)} flight(s) have no ortho.tif ({', '.join(missing)}) — "
+              f"merged ortho.tif will have a gap where they cover the site", file=sys.stderr)
+        warnings.append({"type": "partial_ortho", "flights_without_ortho": missing})
+    elif not have_ortho:
+        print("note: no flight has an ortho.tif — merged ortho.tif will be skipped", file=sys.stderr)
 
     dsm_reproj, ortho_reproj = [], []
     dsm_path_by_id = {}
@@ -210,12 +246,11 @@ def main():
         reproject_or_copy(f["dsm"], d_out, crs, target_crs, a.resampling)
         dsm_reproj.append(d_out)
         dsm_path_by_id[f["id"]] = d_out
-        if have_ortho:
+        if f["ortho"]:
             o_out = tmp / f"{f['id']}_ortho.tif"
-            reproject_or_copy(f["ortho"], o_out, crs, target_crs, "cubic")
+            reproject_or_copy(f["ortho"], o_out, srs_of(f["ortho"]) or crs, target_crs, "cubic")
             ortho_reproj.append(o_out)
 
-    warnings = []
     try:
         bounds_by_id = {fid: bounds_of(p) for fid, p in dsm_path_by_id.items()}
         check_consistency(bounds_by_id, dsm_path_by_id, tmp, warnings)
